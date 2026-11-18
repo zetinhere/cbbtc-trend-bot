@@ -44,9 +44,14 @@ const MAX_SLIPPAGE_BPS = 100;
 // --- state (all of it derived from the bars the harness sends) ---
 const closes: number[] = [];
 let smaSum = 0;
+/** Close the entry was decided on (order sent), refined to the fill bar's open once the fill lands. */
 let entryClose = 0;
 let peakClose = 0;
 let lastExitSeq = -1000000;
+/** True while a buy we sent has not been confirmed by a position yet. */
+let buyPending = false;
+/** Whether the previous batch held the position (to spot the real exit bar). */
+let wasHolding = false;
 
 function sma240(): number | null {
   return closes.length >= SMA_BARS ? smaSum / SMA_BARS : null;
@@ -76,6 +81,22 @@ await runBars({
     if (sma === null || ret60 === null || ret240 === null) return [];
 
     const held = state.positions.get(SYMBOL);
+    // The fill of a buy we sent lands at this bar's open, so the position first
+    // shows up in this batch: anchor the entry (and the stop) to that open
+    // rather than to the close the order was decided on. A buy the market
+    // refused leaves no position, so nothing is anchored and we may retry.
+    if (held !== undefined && buyPending) {
+      entryClose = Number(bar.o);
+      peakClose = Math.max(entryClose, close);
+      buyPending = false;
+    } else if (held === undefined) {
+      buyPending = false;
+      // The position is gone only once the sell actually filled: start the
+      // cooldown from that bar, not from the bar the sell was sent on.
+      if (wasHolding) lastExitSeq = state.seq;
+    }
+    wasHolding = held !== undefined;
+
     const orders: (BuyInput | SellInput)[] = [];
 
     if (held === undefined) {
@@ -86,6 +107,7 @@ await runBars({
           orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS });
           entryClose = close;
           peakClose = close;
+          buyPending = true;
         }
       }
       return orders;
@@ -97,7 +119,6 @@ await runBars({
     const stopped = close <= entryClose * (1 - STOP);
     if (trailing || momentumGone || stopped) {
       orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      lastExitSeq = state.seq;
     }
     return orders;
   },
